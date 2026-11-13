@@ -1,0 +1,145 @@
+# FFmpeg per DF IPTV: solo l'audio Dolby (AC3 ed E-AC3), licenza LGPL.
+#
+# Costruisce, per i quattro tipi di chip di Android, le librerie di FFmpeg
+# (libavutil, libswresample, libavcodec) e il ponte di Media3 che le collega
+# al player (libffmpegJNI). Le librerie restano file separati: chiunque puo'
+# sostituirle con una sua versione di FFmpeg, come chiede la LGPL.
+#
+# Si lancia a mano: Actions > FFmpeg audio per DF IPTV > Run workflow.
+# I file finiti escono in una Release, insieme al sorgente esatto di FFmpeg
+# usato e al sorgente del ponte.
+name: FFmpeg audio per DF IPTV
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  costruisci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # FFmpeg 6.0 e' la versione che Google consiglia per Media3 1.11.0.
+      # Il commit si controlla: un'etichetta spostata ferma tutto.
+      FFMPEG_TAG: n6.0.1
+      FFMPEG_COMMIT: c41ff724ede7da657762d61097e26fac296c53bf
+      MEDIA3_TAG: "1.11.0"
+      PONTE_SHA256: cebafb59c70cd7082d40a94d33680f8627547994758fbd8551ab4b3434d4088c
+      # L'NDK r26b e' quello su cui Google ha provato il modulo FFmpeg.
+      NDK_VERSIONE: "26.1.10909125"
+      # Non oltre la minSdk dell'app (23).
+      API: "23"
+      # Solo cio' che i chip spesso non hanno. Il DTS (dca) entra solo dopo
+      # aver controllato i brevetti.
+      DECODER: "ac3 eac3"
+    steps:
+      - name: NDK di Google
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          printf 'y\ny\ny\ny\n' | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSIONE" > /dev/null
+          test -d "$SDK/ndk/$NDK_VERSIONE/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "NDK=$SDK/ndk/$NDK_VERSIONE" >> "$GITHUB_ENV"
+
+      - name: Sorgenti
+        run: |
+          git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          test "$(git -C ffmpeg rev-parse HEAD)" = "$FFMPEG_COMMIT"
+          curl -fsSL -o ffmpeg_jni.cc "https://raw.githubusercontent.com/androidx/media/$MEDIA3_TAG/libraries/decoder_ffmpeg/src/main/jni/ffmpeg_jni.cc"
+          echo "$PONTE_SHA256  ffmpeg_jni.cc" | sha256sum -c -
+
+      - name: Costruisci
+        run: |
+          set -euo pipefail
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # Pagine da 16 KB: le chiede il Play Store per Android 15 e oltre.
+          PAGINA="-Wl,-z,max-page-size=16384"
+          OUT="$PWD/uscita"
+          mkdir -p "$OUT" rilascio
+          COMUNI="--target-os=android --enable-shared --disable-static --enable-pic
+            --disable-doc --disable-programs --disable-everything --disable-autodetect
+            --disable-avdevice --disable-avformat --disable-swscale --disable-postproc
+            --disable-avfilter --disable-symver --enable-swresample --disable-v4l2-m2m
+            --disable-vulkan --extra-ldexeflags=-pie"
+          for d in $DECODER; do COMUNI="$COMUNI --enable-decoder=$d"; done
+
+          # Ogni libreria finita si controlla prima di uscire.
+          controlla() {
+            local f="$1" nome="$2" testa dinamica n
+            testa="$("$TC/llvm-readelf" -lW "$f")"
+            dinamica="$("$TC/llvm-readelf" -dW "$f")"
+            # Tutti i pezzi allineati a 16 KB.
+            awk '$1=="LOAD" && $NF!="0x4000" {print "pagina non da 16 KB: " $0; e=1} END {exit e}' <<< "$testa"
+            # Niente codice da correggere all'apertura: da Android 6 non si carica.
+            if grep -q TEXTREL <<< "$dinamica"; then echo "TEXTREL in $nome"; exit 1; fi
+            # Il nome interno uguale al file, senza numeri di versione.
+            grep -q "(SONAME).*\[$nome\]" <<< "$dinamica"
+            # Solo le librerie di Android e quelle di FFmpeg.
+            for n in $(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<< "$dinamica"); do
+              case "$n" in
+                libavcodec.so|libavutil.so|libswresample.so|libc.so|libm.so|libdl.so|liblog.so|libandroid.so) ;;
+                *) echo "libreria non prevista in $nome: $n"; exit 1 ;;
+              esac
+            done
+          }
+
+          costruisci() {
+            local abi="$1" triplo="$2" pre extra lib f
+            shift 2
+            pre="$OUT/$abi"
+            (
+              cd ffmpeg
+              ./configure --prefix="$pre" --cross-prefix="$TC/$triplo$API-" \
+                --nm="$TC/llvm-nm" --ar="$TC/llvm-ar" --ranlib="$TC/llvm-ranlib" \
+                --strip="$TC/llvm-strip" $COMUNI "$@" > /dev/null
+              # Solo LGPL, e solo i decoder chiesti.
+              grep -q '^#define FFMPEG_LICENSE "LGPL version 2.1 or later"$' config.h
+              test "$(grep -c '_DECODER 1$' config_components.h)" = "$(wc -w <<< "$DECODER")"
+              make -j"$(nproc)" > /dev/null
+              make install-libs install-headers > /dev/null
+              make distclean > /dev/null
+            )
+            extra=""
+            if [ "$abi" = "arm64-v8a" ]; then extra="-Wl,-Bsymbolic"; fi
+            # Il ponte di Media3, come lo fa il suo CMakeLists.txt: C++11, la
+            # libreria C++ dentro il file (come c++_static).
+            "$TC/$triplo$API-clang++" -std=c++11 -O2 -fPIC -shared -static-libstdc++ \
+              -I"$pre/include" ffmpeg_jni.cc -L"$pre/lib" \
+              -lavcodec -lswresample -lavutil -llog -landroid \
+              -Wl,-soname,libffmpegJNI.so -Wl,--no-undefined $PAGINA $extra \
+              -o "$pre/lib/libffmpegJNI.so"
+            test "$("$TC/llvm-nm" -D --defined-only "$pre/lib/libffmpegJNI.so" | grep -c ' T Java_androidx_media3_decoder_ffmpeg_')" = 9
+            for lib in libavutil libswresample libavcodec libffmpegJNI; do
+              f="$pre/lib/$lib.so"
+              "$TC/llvm-strip" --strip-unneeded "$f"
+              controlla "$f" "$lib.so"
+              cp "$f" "rilascio/${abi}_$lib.so"
+            done
+          }
+
+          costruisci armeabi-v7a armv7a-linux-androideabi --arch=arm --cpu=armv7-a \
+            "--extra-cflags=-march=armv7-a -mfloat-abi=softfp" \
+            "--extra-ldflags=-Wl,--fix-cortex-a8 $PAGINA"
+          costruisci arm64-v8a aarch64-linux-android --arch=aarch64 --cpu=armv8-a \
+            "--extra-ldflags=$PAGINA"
+          costruisci x86 i686-linux-android --arch=x86 --cpu=i686 --disable-asm \
+            "--extra-ldflags=$PAGINA"
+          costruisci x86_64 x86_64-linux-android --arch=x86_64 --cpu=x86-64 --disable-asm \
+            "--extra-ldflags=$PAGINA"
+
+          # I sorgenti esatti, per la LGPL.
+          git -C ffmpeg archive --format=tar --prefix="ffmpeg-$FFMPEG_TAG/" HEAD | xz -9 > "rilascio/sorgente_ffmpeg_$FFMPEG_TAG.tar.xz"
+          cp ffmpeg_jni.cc "rilascio/sorgente_ponte_media3_$MEDIA3_TAG.cc"
+          ( cd rilascio && md5sum -- *.so > md5.txt )
+          ls -l rilascio
+          cat rilascio/md5.txt
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "audio-$GITHUB_RUN_NUMBER" rilascio/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "FFmpeg $FFMPEG_TAG, audio AC3 ed E-AC3, per Media3 $MEDIA3_TAG" \
+            --notes "FFmpeg $FFMPEG_TAG (https://ffmpeg.org), licenza LGPL 2.1 o successiva, costruito senza --enable-gpl, coi soli decoder: $DECODER. Il sorgente esatto e' sorgente_ffmpeg_$FFMPEG_TAG.tar.xz; la ricetta e' .github/workflows/ffmpeg.yml di questo progetto. Il ponte (libffmpegJNI) e' di Media3 $MEDIA3_TAG, licenza Apache 2.0. NDK $NDK_VERSIONE, API $API."
